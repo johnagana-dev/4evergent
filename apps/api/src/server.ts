@@ -50,6 +50,13 @@ function parseRetentionInterval(value: string | undefined, fallback: number): nu
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/** Parse an optional positive-integer env var; undefined when unset/invalid. */
+function envPositiveInt(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : undefined;
+}
+
 /**
  * Parse a worker interval env var. Unset or empty means "use the worker's
  * built-in default" (returns undefined). Anything else must be a finite number
@@ -222,6 +229,12 @@ async function main() {
         : "lax",
       stellarDomain: process.env.STELLAR_DOMAIN || new URL(webOrigin).hostname,
       allowRegistration: process.env.ALLOW_REGISTRATION === "0" ? false : true,
+      rateLimit: {
+        maxAttempts: envPositiveInt(process.env.AUTH_RATE_LIMIT_MAX),
+        windowSeconds: envPositiveInt(process.env.AUTH_RATE_LIMIT_WINDOW_SECONDS),
+        maxKeys: envPositiveInt(process.env.AUTH_RATE_LIMIT_MAX_KEYS),
+        trustProxy: process.env.AUTH_TRUST_PROXY === "1",
+      },
     },
   });
 

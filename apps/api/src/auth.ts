@@ -34,8 +34,14 @@ import { DatabaseSync } from "node:sqlite";
 import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import type { AuthProvider, AuthenticatedPrincipal } from "@4evergent/shared";
+import { SlidingWindowRateLimiter, clientKey } from "./rate-limit.js";
 
 export const SESSION_COOKIE_NAME = "four_eg_session";
+
+/** Conservative credential-endpoint rate limit: 10 attempts / 60s / source. */
+export const DEFAULT_AUTH_RATE_LIMIT_MAX = 10;
+export const DEFAULT_AUTH_RATE_LIMIT_WINDOW_SECONDS = 60;
+export const DEFAULT_AUTH_RATE_LIMIT_MAX_KEYS = 10_000;
 
 export type AuthMethod = "email" | "google" | "stellar";
 
@@ -52,6 +58,17 @@ export interface AuthModuleConfig {
   stellarDomain?: string;
   /** Open registration endpoint. Default true (bootstrap-friendly, testnet MVP). */
   allowRegistration?: boolean;
+  /** Abuse protection for the credential endpoints (see rate-limit.ts). */
+  rateLimit?: {
+    /** Attempts allowed per window, per source. Default 10. */
+    maxAttempts?: number;
+    /** Window length in seconds. Default 60. */
+    windowSeconds?: number;
+    /** Hard cap on tracked sources. Default 10000. */
+    maxKeys?: number;
+    /** Trust the first X-Forwarded-For hop (only behind a proxy you control). */
+    trustProxy?: boolean;
+  };
 }
 
 export interface PrincipalResolution {
@@ -283,6 +300,10 @@ function normalizeEmail(email: unknown): string | null {
   return e;
 }
 
+function positiveNumber(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 function hashPassword(password: string, salt: Buffer): Buffer {
   return scryptSync(password, salt, 64);
 }
@@ -344,6 +365,21 @@ export function createAuthModule(opts: {
   const ttlS = Math.max(60, Math.min(cfg.sessionTtlSeconds ?? 86400, 30 * 86400));
   const webOrigin = (cfg.webOrigin ?? "http://localhost:5173").replace(/\/+$/, "");
   const stellarDomain = cfg.stellarDomain ?? "localhost";
+
+  // Abuse protection for the credential endpoints. Keyed by source (client IP)
+  // and scoped per endpoint, so one endpoint's legitimate traffic cannot lock
+  // a source out of another. In-memory, matching the rest of this module.
+  const rl = cfg.rateLimit ?? {};
+  const rateLimitConfig = {
+    maxAttempts: positiveNumber(rl.maxAttempts, DEFAULT_AUTH_RATE_LIMIT_MAX),
+    windowMs: positiveNumber(rl.windowSeconds, DEFAULT_AUTH_RATE_LIMIT_WINDOW_SECONDS) * 1000,
+    maxKeys: positiveNumber(rl.maxKeys, DEFAULT_AUTH_RATE_LIMIT_MAX_KEYS),
+  };
+  const trustProxy = rl.trustProxy === true;
+  const loginLimiter = new SlidingWindowRateLimiter(rateLimitConfig);
+  const registerLimiter = new SlidingWindowRateLimiter(rateLimitConfig);
+  const challengeLimiter = new SlidingWindowRateLimiter(rateLimitConfig);
+  const verifyLimiter = new SlidingWindowRateLimiter(rateLimitConfig);
 
   const googleConfigured = Boolean(cfg.google?.clientId && cfg.google?.clientSecret);
   const googleJwks = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth2/v3/certs"));
@@ -445,6 +481,25 @@ export function createAuthModule(opts: {
     res.end(JSON.stringify(body));
   }
 
+  /**
+   * Check the per-source limit for a credential endpoint. Returns the source
+   * key when the request may proceed, or null after writing a 429 (with a
+   * Retry-After header) when the limit is exceeded.
+   *
+   * Rate checking occurs BEFORE parsing or validating credentials (such as
+   * running expensive scrypt hashing). This sheds traffic early and protects
+   * the server from CPU exhaustion during brute-force attacks.
+   */
+  function rateLimitGate(limiter: SlidingWindowRateLimiter, req: any, res: any): string | null {
+    const key = clientKey(req, trustProxy);
+    const decision = limiter.check(key);
+    if (decision.limited) {
+      sendJson(res, 429, { error: "rate_limited" }, { "Retry-After": String(decision.retryAfterSeconds) });
+      return null;
+    }
+    return key;
+  }
+
   function redirect(res: any, location: string, headers: Record<string, string> = {}) {
     res.writeHead(302, { Location: location, ...headers });
     res.end();
@@ -488,6 +543,9 @@ export function createAuthModule(opts: {
         sendJson(res, 403, { error: "registration_disabled" });
         return true;
       }
+      const rlKey = rateLimitGate(registerLimiter, req, res);
+      if (rlKey === null) return true;
+      registerLimiter.record(rlKey);
       const body = await readJson(req);
       const email = normalizeEmail(body?.email);
       const password = typeof body?.password === "string" ? body.password : "";
@@ -515,6 +573,8 @@ export function createAuthModule(opts: {
 
     // ---- POST /auth/login/email
     if (method === "POST" && path === "/auth/login/email") {
+      const rlKey = rateLimitGate(loginLimiter, req, res);
+      if (rlKey === null) return true;
       const body = await readJson(req);
       const email = normalizeEmail(body?.email);
       const password = typeof body?.password === "string" ? body.password : "";
@@ -525,9 +585,15 @@ export function createAuthModule(opts: {
           : false;
       if (!ok || !user || !user.passwordHash || !user.passwordSalt) {
         // identical response for unknown email and wrong password — no enumeration
+        loginLimiter.record(rlKey);
         sendJson(res, 401, { error: "invalid_credentials" });
         return true;
       }
+      // Legitimate sign-in clears the source's counter so an authentic user who
+      // made typos isn't penalised. Note: once a source has exhausted its budget
+      // and is rate-limited (429), it is rejected at the gate above BEFORE reaching
+      // this point, protecting server CPU from scrypt exhaustion.
+      loginLimiter.reset(rlKey);
       const { token } = createSession(user, "email");
       sendJson(res, 200, { subject: user.subject }, { "Set-Cookie": sessionCookie(token, ttlS, secure) });
       return true;
@@ -535,6 +601,9 @@ export function createAuthModule(opts: {
 
     // ---- POST /auth/stellar/challenge
     if (method === "POST" && path === "/auth/stellar/challenge") {
+      const rlKey = rateLimitGate(challengeLimiter, req, res);
+      if (rlKey === null) return true;
+      challengeLimiter.record(rlKey);
       const body = await readJson(req);
       const publicKey = typeof body?.publicKey === "string" ? body.publicKey : "";
       if (!StrKey.isValidEd25519PublicKey(publicKey)) {
@@ -569,6 +638,9 @@ export function createAuthModule(opts: {
 
     // ---- POST /auth/stellar/verify
     if (method === "POST" && path === "/auth/stellar/verify") {
+      const rlKey = rateLimitGate(verifyLimiter, req, res);
+      if (rlKey === null) return true;
+      verifyLimiter.record(rlKey);
       const body = await readJson(req);
       const publicKey = typeof body?.publicKey === "string" ? body.publicKey : "";
       const challengeId = typeof body?.challengeId === "string" ? body.challengeId : "";
