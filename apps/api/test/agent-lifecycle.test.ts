@@ -493,3 +493,197 @@ test("LIST: owner isolation unchanged — cross-owner agent absent, no status le
     await close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// PATCH /agents/:id — general metadata update
+// ---------------------------------------------------------------------------
+
+test("PATCH /agents/:id — owner can update displayName, description, capabilities", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", {
+      displayName: "Renamed Agent",
+      description: "updated description",
+      capabilities: ["payment", "transfer"],
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.displayName, "Renamed Agent");
+    assert.equal(res.body.description, "updated description");
+    assert.deepEqual(res.body.capabilities, ["payment", "transfer"]);
+
+    const check = await get(baseUrl, "/agents/agent-a");
+    assert.equal(check.status, 200);
+    assert.equal(check.body.displayName, "Renamed Agent");
+    assert.equal(check.body.description, "updated description");
+    assert.deepEqual(check.body.capabilities, ["payment", "transfer"]);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — partial update leaves other fields untouched", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", { description: "only desc" });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.description, "only desc");
+    assert.equal(res.body.displayName, "Agent agent-a");
+    assert.deepEqual(res.body.capabilities, ["payment"]);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — over-length displayName returns 400", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", {
+      displayName: "x".repeat(101),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — empty displayName returns 400", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", { displayName: "" });
+    assert.equal(res.status, 400);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — over-length description returns 400", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", {
+      description: "x".repeat(1001),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — over-length capabilities array returns 400", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", {
+      capabilities: Array.from({ length: 33 }, (_, i) => `cap${i}`),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — over-length capability string returns 400", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", {
+      capabilities: ["x".repeat(33)],
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — non-string capability item returns 400", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", {
+      capabilities: [123 as unknown as string],
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — status field is rejected on this route", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", { status: "paused" });
+    assert.equal(res.status, 400);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — non-owner patch returns 404", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-b", "owner-b"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-b", {
+      displayName: "Hijacked",
+    });
+    assert.equal(res.status, 404);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — nonexistent agent returns 404", async () => {
+  const { baseUrl, close } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  try {
+    const res = await patch(baseUrl, "/agents/does-not-exist", {
+      displayName: "Ghost",
+    });
+    assert.equal(res.status, 404);
+  } finally {
+    await close();
+  }
+});
+
+test("PATCH /agents/:id — unknown fields are ignored", async () => {
+  const { baseUrl, close, registerAgent } = await startServer({
+    authProvider: new DevAuthProvider({ defaultOwnerId: "owner-a" }),
+  });
+  registerAgent(makeAgent("agent-a", "owner-a"));
+  try {
+    const res = await patch(baseUrl, "/agents/agent-a", {
+      displayName: "Kept",
+      unknownField: "ignored",
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.displayName, "Kept");
+    assert.equal(res.body.unknownField, undefined);
+  } finally {
+    await close();
+  }
+});

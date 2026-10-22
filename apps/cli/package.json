@@ -13,7 +13,7 @@
   },
   "scripts": {
     "prepare": "pnpm run build",
-    "build": "tsc -p tsconfig.json && node --input-type=module -e \"import { readFileSync, writeFileSync } from 'node:fs'; const { version } = JSON.parse(readFileSync('package.json', 'utf8')); const file = 'dist/cli.js'; const source = readFileSync(file, 'utf8'); const declaration = /^const VERSION = .*;$/m; if (!declaration.test(source)) throw new Error('CLI version declaration missing'); writeFileSync(file, source.replace(declaration, 'const VERSION = ' + JSON.stringify(version) + ';'));\"",
+    "build": "node init && tsc -p tsconfig.json && node --input-type=module -e \"import { readFileSync, writeFileSync } from 'node:fs'; const { version } = JSON.parse(readFileSync('package.json', 'utf8')); const file = 'dist/cli.js'; const source = readFileSync(file, 'utf8'); const declaration = /^const VERSION = .*;$/m; if (!declaration.test(source)) throw new Error('CLI version declaration missing'); writeFileSync(file, source.replace(declaration, 'const VERSION = ' + JSON.stringify(version) + ';'));\"",
     "test": "tsx --test test/*.test.ts",
     "test:coverage": "tsx --test --experimental-test-coverage --test-coverage-lines=72 --test-coverage-branches=52 --test-coverage-include=src/** --test-coverage-exclude=**/dist/** --test-coverage-exclude=**/test/** --test-coverage-exclude=**/__tests__/** --test-coverage-exclude=**/mocks/** --test-coverage-exclude=**/*.mock.ts --test-coverage-exclude=**/*.test-helper.ts test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
