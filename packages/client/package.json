@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "build": "pnpm --filter @4evergent/shared build && tsc -p tsconfig.json",
+    "build": "node init && pnpm --filter @4evergent/shared build && tsc -p tsconfig.json",
     "test": "pnpm run build && tsc -p test/tsconfig.json --noEmit && tsx --test test/*.test.ts",
     "typecheck": "pnpm --filter @4evergent/shared build && tsc -p tsconfig.json --noEmit"
   },
