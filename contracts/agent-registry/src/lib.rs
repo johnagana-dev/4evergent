@@ -48,6 +48,13 @@
 //! | each capability | at most [`MAX_CAPABILITY_LEN`] (32) bytes | `Error::CapabilityTooLong` |
 //! | each capability | distinct from every other entry | `Error::CapabilityDuplicate` |
 //!
+//! The API-side `PATCH /agents/:id` endpoint mirrors these caps for the
+//! mutable metadata fields: `displayName` (≤ 100 chars in the API, stricter
+//! than the on-chain 128-byte cap), `description` (API-only, ≤ 500 chars),
+//! and `capabilities` (≤ [`MAX_CAPABILITIES`] entries, each ≤
+//! [`MAX_CAPABILITY_LEN`] bytes). `status` and `stellarAddress` are not
+//! mutable through that endpoint.
+//!
 //! Decisions stated explicitly (each is a deliberate choice, not an accident):
 //!
 //! - **Duplicate capabilities are rejected**, and the comparison is **exact
@@ -70,6 +77,11 @@
 //!   count is checked first (`TooManyCapabilities`), then each capability is
 //!   examined in order and the first violation wins, in the order
 //!   `CapabilityEmpty` → `CapabilityTooLong` → `CapabilityDuplicate`.
+//! - **`stellar_address` is immutable after registration.** There is no
+//!   entrypoint to change it, and the API's `PATCH /agents/:id` route rejects
+//!   it. Rebinding a signer address is a security-sensitive operation that
+//!   needs its own consent flow (see `register`), so it is deliberately out
+//!   of scope for a metadata patch.
 //!
 //! Future: delegation, multi-sig registration, capability discovery events.
 
@@ -88,6 +100,12 @@ const MAX_CAPABILITIES: u32 = 32;
 
 /// Max accepted length of a single capability string, in bytes.
 const MAX_CAPABILITY_LEN: u32 = 32;
+
+/// Max accepted length of `display_name` on the API side, in characters.
+/// Stricter than the on-chain [`MAX_DISPLAY_NAME_LEN`] so the API can reject
+/// over-long names before they reach the contract. Exposed here so the API
+/// and contract agree on the cap.
+pub const API_MAX_DISPLAY_NAME_LEN: u32 = 100;
 
 #[contracttype]
 #[derive(Clone)]
@@ -109,6 +127,12 @@ pub struct AgentInfo {
 pub enum DataKey {
     Agent(String),
 }
+
+/// Max accepted length of `description` on the API side, in characters.
+/// `description` is API-only metadata (not stored on-chain); the cap lives
+/// here so the API and contract share one source of truth for agent metadata
+/// limits.
+pub const API_MAX_DESCRIPTION_LEN: u32 = 500;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -132,6 +156,9 @@ pub enum Error {
     /// Comparison is exact byte equality (case-sensitive, no trimming) — see
     /// the module-level "Validation rules" section.
     CapabilityDuplicate = 13,
+    /// A field that is not mutable through the metadata-update path was
+    /// supplied (e.g. `status` or `stellar_address` on `PATCH /agents/:id`).
+    FieldNotMutable = 14,
 }
 
 #[contract]
@@ -176,6 +203,29 @@ fn validate_display_name(name: &String) -> Result<(), Error> {
     Ok(())
 }
 
+/// Reject a `description` longer than [`API_MAX_DESCRIPTION_LEN`]. An empty
+/// description is allowed (it clears the field). `description` is API-only
+/// metadata; this validator exists so the API and contract agree on the cap.
+pub fn validate_description(description: &String) -> Result<(), Error> {
+    if description.len() > API_MAX_DESCRIPTION_LEN {
+        return Err(Error::DisplayNameTooLong);
+    }
+    Ok(())
+}
+
+/// Reject a `display_name` longer than [`API_MAX_DISPLAY_NAME_LEN`] (the
+/// stricter API-side cap). Used by the API's `PATCH /agents/:id` route so the
+/// API rejects over-long names before the on-chain validator would.
+pub fn validate_api_display_name(name: &String) -> Result<(), Error> {
+    if name.is_empty() {
+        return Err(Error::DisplayNameEmpty);
+    }
+    if name.len() > API_MAX_DISPLAY_NAME_LEN {
+        return Err(Error::DisplayNameTooLong);
+    }
+    Ok(())
+}
+
 /// Reject a capability list that is too large, or that contains an empty,
 /// over-long, or duplicated entry. Duplicates are compared by exact byte
 /// equality (case-sensitive, no trimming) — see the module docs.
@@ -202,6 +252,17 @@ fn validate_capabilities(caps: &Vec<String>) -> Result<(), Error> {
                 return Err(Error::CapabilityDuplicate);
             }
         }
+    }
+    Ok(())
+}
+
+/// Reject a patch that attempts to mutate a field that is not mutable through
+/// the metadata-update path. `status` belongs to the dedicated status
+/// endpoint; `stellar_address` is immutable after registration (see module
+/// docs). Both are rejected here so the API and contract agree.
+pub fn validate_mutable_fields(status_supplied: bool, stellar_address_supplied: bool) -> Result<(), Error> {
+    if status_supplied || stellar_address_supplied {
+        return Err(Error::FieldNotMutable);
     }
     Ok(())
 }
@@ -1344,5 +1405,61 @@ mod test {
         });
 
         assert!(events.is_empty(), "failed update must not emit an event");
+    }
+
+    // ---- API-side metadata caps (PATCH /agents/:id) ----
+
+    // The API-side display_name cap is stricter than the on-chain cap and is
+    // enforced before the on-chain validator would fire.
+    #[test]
+    fn test_api_display_name_cap() {
+        let (env, _cid, _client) = setup();
+        // Exactly at the API cap: accepted.
+        let at_limit = String::from_str(&env, &"d".repeat(API_MAX_DISPLAY_NAME_LEN as usize));
+        assert_eq!(validate_api_display_name(&at_limit), Ok(()));
+        // One over the API cap: rejected, even though it is under the
+        // on-chain MAX_DISPLAY_NAME_LEN.
+        let over = String::from_str(&env, &"d".repeat(API_MAX_DISPLAY_NAME_LEN as usize + 1));
+        assert_eq!(
+            validate_api_display_name(&over),
+            Err(Error::DisplayNameTooLong)
+        );
+        // Empty: rejected.
+        let empty = String::from_str(&env, "");
+        assert_eq!(
+            validate_api_display_name(&empty),
+            Err(Error::DisplayNameEmpty)
+        );
+    }
+
+    // The API-side description cap is enforced and an empty description is
+    // allowed (it clears the field).
+    #[test]
+    fn test_api_description_cap() {
+        let (env, _cid, _client) = setup();
+        let empty = String::from_str(&env, "");
+        assert_eq!(validate_description(&empty), Ok(()));
+        let at_limit = String::from_str(&env, &"x".repeat(API_MAX_DESCRIPTION_LEN as usize));
+        assert_eq!(validate_description(&at_limit), Ok(()));
+        let over = String::from_str(&env, &"x".repeat(API_MAX_DESCRIPTION_LEN as usize + 1));
+        assert_eq!(validate_description(&over), Err(Error::DisplayNameTooLong));
+    }
+
+    // `status` and `stellar_address` are rejected on the metadata-update path.
+    #[test]
+    fn test_immutable_fields_rejected() {
+        assert_eq!(validate_mutable_fields(false, false), Ok(()));
+        assert_eq!(
+            validate_mutable_fields(true, false),
+            Err(Error::FieldNotMutable)
+        );
+        assert_eq!(
+            validate_mutable_fields(false, true),
+            Err(Error::FieldNotMutable)
+        );
+        assert_eq!(
+            validate_mutable_fields(true, true),
+            Err(Error::FieldNotMutable)
+        );
     }
 }
