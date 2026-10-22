@@ -201,12 +201,21 @@ Machine clients are unchanged: `API_KEYS` maps a bearer secret to exactly one se
 
 **Consequences:** Running more than one API instance behind a load balancer breaks login: a callback or challenge verification can land on a process that never saw the state, and the single-use guarantee does not hold across processes. This is stated as a real limitation, not hidden — horizontal scaling requires moving this state to a shared store first. Sessions themselves survive a restart when SQLite is configured, and expired sessions are swept by the retention worker (ADR-014) via `sweepExpiredSessions()` (`apps/api/src/auth.ts:774`).
 
-## ADR-021: Login-endpoint rate limiting is undecided
+## ADR-021: In-memory rate limiting for the credential endpoints
 
-**Status:** Proposed
+**Status:** Accepted
 
-**Context:** The auth module exposes unauthenticated endpoints that do work per request: `POST /auth/register`, `POST /auth/login/email` (scrypt is deliberately slow, so each attempt costs CPU), `GET /auth/stellar/challenge`, and `GET /auth/google/start`. No rate limit, lockout, or backoff is implemented in `apps/api/src/auth.ts`. Open registration (ADR-018) plus an unthrottled login endpoint is an enumeration and credential-stuffing surface.
+**Context:** The credential-taking endpoints (`/auth/login/email`, `/auth/register`, `/auth/stellar/challenge`, `/auth/stellar/verify`) are handled before the API-key gate and had no counter, cooldown, or per-source tracking, so passwords could be guessed without bound. The module's state is already in-memory (`UserStore`/`SessionStore` fall back to `Map`s, pending OAuth states and Stellar challenges live in `Map`s), the deployment is a single stateful Node process, and adding a runtime dependency is out of scope.
 
-**Decision:** None yet. The options are per-IP throttling in front of the API (reverse proxy), an in-process counter keyed by IP/account, or deferring to an edge/WAF rule. No answer is recorded here because the deployment topology that would decide it (single process vs. multiple instances, whether a proxy already terminates this) is not fixed.
+**Decision:** Add a dependency-free sliding-window limiter (`apps/api/src/rate-limit.ts`) applied per credential endpoint. It is keyed by client IP (`req.socket.remoteAddress`, or the first `X-Forwarded-For` hop when `AUTH_TRUST_PROXY=1` is explicitly set), bounded in memory (window-pruned timestamps, per-key history capped at the limit, key map capped at `AUTH_RATE_LIMIT_MAX_KEYS` with oldest-first eviction), and safe to reset (a successful email sign-in within budget clears the source counter). Over-limit requests get `429 { error: "rate_limited" }` with a `Retry-After` header, distinct from `401 invalid_credentials`. Limits and window are env-configurable (`AUTH_RATE_LIMIT_MAX`, `AUTH_RATE_LIMIT_WINDOW_SECONDS`) with conservative defaults of 10 attempts / 60s.
 
-**Consequences:** Until this is decided, operators should treat the auth endpoints as untrusted-input surfaces and place a rate limit in front of them. Any decision recorded here must state whether the limit is per-IP, per-account, or both, and whether a lockout is permanent or time-boxed — a permanent lockout is itself a denial-of-service vector.
+When `AUTH_TRUST_PROXY=1` is enabled, the trusted reverse proxy MUST be configured to overwrite or safely sanitize client-supplied forwarding headers so that an attacker cannot prepend a forged IP. Furthermore, rate limiting checks occur prior to credential verification; once a source hits the 429 threshold, subsequent requests are shed early to protect server CPU from scrypt exhaustion until the sliding window slides past.
+
+**Consequences:**
+- Brute-force / credential-stuffing attempts are slowed and a client can distinguish "slow down" from "wrong password".
+- No new runtime dependency; no schema or persistence change.
+- **Locality constraint:** state is per-process and in-memory, so it is not shared across instances and resets on restart. Horizontally scaled deployments get `max × processes` effective rate; a shared store is a separate, larger change.
+- IP-keyed limits share a bucket behind NAT/proxies and can be evaded by rotating source addresses; CAPTCHA/MFA/account lockout remain out of scope.
+- Shedding over-limit requests before scrypt prevents CPU DoS, but means locked-out sources cannot reset until the window expires.
+- The existing `401 invalid_credentials` response and user-enumeration defence are unchanged.
+
