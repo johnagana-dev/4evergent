@@ -224,6 +224,27 @@ Body: `{ "status": "active" | "paused" | "disabled" }`
 - `400` → invalid status / invalid JSON
 - `404` → not found or not owned
 
+### PATCH /agents/:id
+
+Update an agent's metadata fields (owner-scoped). Only the fields present in
+the body are changed; omitted fields are left untouched.
+
+Body (all fields optional, at least one required):
+
+- `displayName` — non-empty string, ≤100 chars (trimmed).
+- `description` — string, ≤500 chars.
+- `capabilities` — array of strings, ≤32 entries, each ≤32 chars (trimmed,
+  non-empty, unique).
+
+`status` and `stellarAddress` are **not** mutable on this route. Use
+`PATCH /agents/:id/status` for status changes; `stellarAddress` is immutable
+after creation because changing the signer address has security implications.
+Unknown fields are rejected.
+
+- `200` → `{ "agent": AgentRecord }`
+- `400` → invalid JSON / no updatable fields / a field failed validation
+- `404` → not found or not owned
+
 ---
 
 ## Intents
@@ -639,6 +660,7 @@ The client follows the documented API surface with these method names:
 | `GET /agents` | `listAgents` |
 | `GET /agents/:id` | `getAgent` |
 | `PATCH /agents/:id/status` | `updateAgentStatus` |
+| `PATCH /agents/:id` | `updateAgent` |
 | `POST /agents/:id/intents` | `submitIntent` |
 | `GET /approvals` | `listApprovals` |
 | `GET /approvals/:id` | `getApproval` |
